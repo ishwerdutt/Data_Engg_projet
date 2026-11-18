@@ -310,11 +310,30 @@ def get_movie_details(movie_id: int):
         }
 
 
+LIVE_USER_OFFSET = 1_000_000
+
+
+def to_warehouse_user_id(user_id: int) -> int:
+    """
+    Surrogate Key Isolation (Problem 4):
+    Offsets Django auth_user.id by +1,000,000 to prevent surrogate key collisions
+    with the 200,948 historical MovieLens dataset users (range: 1 - 200,948).
+    Live web application users are segregated into the 1,000,001+ range in dim_users.
+    """
+    if user_id is None:
+        return None
+    uid = int(user_id)
+    if uid >= LIVE_USER_OFFSET:
+        return uid
+    return uid + LIVE_USER_OFFSET
+
+
 def get_user_movie_rating(user_id: int, movie_id: int):
     """
     Returns user's rating for a specific movie if one exists, else None.
     Uses idx_fact_ratings_user_movie for sub-millisecond execution.
     """
+    wh_user_id = to_warehouse_user_id(user_id)
     with connection.cursor() as cur:
         cur.execute("""
             SELECT rating
@@ -322,15 +341,17 @@ def get_user_movie_rating(user_id: int, movie_id: int):
             WHERE user_id = %s AND movie_id = %s
             ORDER BY rating_id DESC
             LIMIT 1;
-        """, [user_id, movie_id])
+        """, [wh_user_id, movie_id])
         row = cur.fetchone()
         return float(row[0]) if row else None
 
 
 def upsert_user_rating(user_id: int, movie_id: int, rating: float):
     """
-    Problem 4: Allows a user to rate or modify an existing rating.
+    Problem 4: Allows an authenticated user to rate or modify an existing rating.
+    Auto-provisions missing calendar date keys and segregated warehouse user keys.
     """
+    wh_user_id = to_warehouse_user_id(user_id)
     import datetime
     today = datetime.date.today()
     date_key = today.year * 10000 + today.month * 100 + today.day
@@ -343,18 +364,18 @@ def upsert_user_rating(user_id: int, movie_id: int, rating: float):
             ON CONFLICT (date_key) DO NOTHING;
         """, [date_key, today, today.year, (today.month - 1) // 3 + 1, today.month, today.day])
 
-        # 2. Ensure user exists in dim_users
+        # 2. Ensure segregated user exists in dim_users (1,000,000+ range)
         cur.execute("""
             INSERT INTO dim_users (user_id)
             VALUES (%s)
             ON CONFLICT (user_id) DO NOTHING;
-        """, [user_id])
+        """, [wh_user_id])
 
         # 3. Check for existing rating by user for this movie
         cur.execute("""
             SELECT rating_id FROM fact_ratings
             WHERE user_id = %s AND movie_id = %s;
-        """, [user_id, movie_id])
+        """, [wh_user_id, movie_id])
         existing = cur.fetchone()
 
         if existing:
@@ -368,12 +389,13 @@ def upsert_user_rating(user_id: int, movie_id: int, rating: float):
             cur.execute("""
                 INSERT INTO fact_ratings (user_id, movie_id, date_key, rating)
                 VALUES (%s, %s, %s, %s);
-            """, [user_id, movie_id, date_key, rating])
+            """, [wh_user_id, movie_id, date_key, rating])
             action = 'inserted'
 
         return {
             'action': action,
             'user_id': user_id,
+            'warehouse_user_id': wh_user_id,
             'movie_id': movie_id,
             'rating': rating,
             'date_key': date_key
@@ -385,11 +407,12 @@ def get_user_rating(user_id: int, movie_id: int):
     Retrieves the rating given by a specific user for a movie.
     Returns float rating (e.g. 2.5) or None if the user hasn't rated this movie.
     """
+    wh_user_id = to_warehouse_user_id(user_id)
     with connection.cursor() as cur:
         cur.execute("""
             SELECT rating FROM fact_ratings
             WHERE user_id = %s AND movie_id = %s;
-        """, [user_id, movie_id])
+        """, [wh_user_id, movie_id])
         row = cur.fetchone()
         return float(row[0]) if row else None
 
