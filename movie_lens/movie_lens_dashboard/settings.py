@@ -35,11 +35,37 @@ ALLOWED_HOSTS = [
     host.strip()
     for host in os.environ.get('ALLOWED_HOSTS', '').split(',')
     if host.strip()
-] or (['localhost', '127.0.0.1'] if DEBUG else [])
+] or (['*'] if DEBUG else ['localhost', '127.0.0.1'])
 
 RENDER_EXTERNAL_HOSTNAME = os.environ.get('RENDER_EXTERNAL_HOSTNAME')
 if RENDER_EXTERNAL_HOSTNAME:
     ALLOWED_HOSTS.append(RENDER_EXTERNAL_HOSTNAME)
+
+# Support reverse-proxy SSL termination (Render, Cloudflare, etc.)
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get('CSRF_TRUSTED_ORIGINS', '').split(',')
+    if origin.strip()
+]
+# Automatically trust Render domains for CSRF POST requests
+CSRF_TRUSTED_ORIGINS.append('https://*.onrender.com')
+if RENDER_EXTERNAL_HOSTNAME:
+    CSRF_TRUSTED_ORIGINS.append(f'https://{RENDER_EXTERNAL_HOSTNAME}')
+
+if DEBUG:
+    # Allow local development connections and CSRF verification across LAN
+    for port in ('8000', '8080'):
+        CSRF_TRUSTED_ORIGINS.extend([
+            f'http://localhost:{port}',
+            f'http://127.0.0.1:{port}',
+            f'http://0.0.0.0:{port}',
+            f'http://*.local:{port}',
+        ])
+    for host in list(ALLOWED_HOSTS):
+        if host and host != '*':
+            CSRF_TRUSTED_ORIGINS.extend([f'http://{host}:8000', f'https://{host}'])
 
 
 # Application definition
@@ -160,7 +186,6 @@ STORAGES = {
 }
 
 if not DEBUG:
-    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
     SECURE_SSL_REDIRECT = os.environ.get('SECURE_SSL_REDIRECT', 'True').lower() in ('true', '1', 'yes')
     SESSION_COOKIE_SECURE = True
     CSRF_COOKIE_SECURE = True
