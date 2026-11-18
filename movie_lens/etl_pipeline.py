@@ -21,6 +21,9 @@ DB_USER = os.environ.get("DB_USER", "gumbo")
 DB_PASSWORD = os.environ.get("DB_PASSWORD", "2836")
 DB_HOST = os.environ.get("DB_HOST", "localhost")
 DB_PORT = os.environ.get("DB_PORT", "5432")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+DATA_LIMIT = int(os.environ.get("DATA_LIMIT", "0") or 0)
+DATA_LIMIT = DATA_LIMIT if DATA_LIMIT > 0 else None
 
 DB_URI = f"dbname={DB_NAME} user={DB_USER} password={DB_PASSWORD} host={DB_HOST} port={DB_PORT}"
 
@@ -79,7 +82,7 @@ def run_etl():
     dataset_dir = resolve_dataset_dir()
     print(f"Using dataset from: {dataset_dir}")
     
-    with psycopg.connect(DB_URI) as conn:
+    with psycopg.connect(DATABASE_URL or DB_URI) as conn:
         with conn.cursor() as cur:
             # Handle --reset or --force flags
             if '--reset' in sys.argv or '--force' in sys.argv or os.environ.get("FORCE_RELOAD") == "1":
@@ -199,7 +202,12 @@ def run_etl():
                 print("\n[Step 3/6] Extracting & Ingesting Dim Users from ratings.csv...")
                 ratings_csv_path = dataset_dir / 'ratings.csv'
                 t_users = time.time()
-                user_series = pd.read_csv(ratings_csv_path, usecols=['userId'], dtype='int32')['userId'].unique()
+                user_series = pd.read_csv(
+                    ratings_csv_path,
+                    usecols=['userId'],
+                    dtype='int32',
+                    nrows=DATA_LIMIT,
+                )['userId'].unique()
                 users_df = pd.DataFrame({'user_id': sorted(user_series)})
                 buf_users = io.StringIO()
                 users_df.to_csv(buf_users, sep='\t', index=False, header=False)
@@ -210,7 +218,8 @@ def run_etl():
             # ---------------------------------------------------------
             # 4. Fact Ratings (~33.8M rows in ml-latest)
             # ---------------------------------------------------------
-            if ratings_count >= 33_000_000:
+            ratings_target = DATA_LIMIT or 33_000_000
+            if ratings_count >= ratings_target:
                 print(f"\n[Step 4/6] fact_ratings ALREADY COMPLETE ({ratings_count:,} rows)! Skipping...")
             else:
                 print(f"\n[Step 4/6] Ingesting Fact Ratings (currently {ratings_count:,} rows)...")
@@ -221,7 +230,12 @@ def run_etl():
                 total_loaded = 0
                 ratings_csv_path = dataset_dir / 'ratings.csv'
 
-                for chunk_idx, chunk in enumerate(pd.read_csv(ratings_csv_path, chunksize=chunk_size)):
+                rating_chunks = pd.read_csv(
+                    ratings_csv_path,
+                    chunksize=chunk_size,
+                    nrows=DATA_LIMIT,
+                )
+                for chunk_idx, chunk in enumerate(rating_chunks):
                     t_chunk = time.time()
                     dt = pd.to_datetime(chunk['timestamp'], unit='s')
                     chunk['date_key'] = (dt.dt.year * 10000 + dt.dt.month * 100 + dt.dt.day).astype('int32')
@@ -249,7 +263,19 @@ def run_etl():
                 if tags_csv_path.exists():
                     print("\n[Step 5/6] Ingesting Fact Tags...")
                     t_tags = time.time()
-                    tags_df = pd.read_csv(tags_csv_path)
+                    cur.execute("SELECT user_id FROM dim_users")
+                    sample_user_ids = {row[0] for row in cur.fetchall()}
+                    cur.execute("SELECT movie_id FROM dim_movies")
+                    sample_movie_ids = {row[0] for row in cur.fetchall()}
+
+                    tags_df = pd.read_csv(
+                        tags_csv_path,
+                        nrows=DATA_LIMIT,
+                    )
+                    tags_df = tags_df[
+                        tags_df['userId'].isin(sample_user_ids)
+                        & tags_df['movieId'].isin(sample_movie_ids)
+                    ].copy()
                     tags_df = tags_df.dropna(subset=['tag'])
                     
                     # Clean tag text: strip, remove delimiters, and remove backslashes (which escape newlines in COPY)
@@ -306,7 +332,10 @@ def run_etl():
                 print(" -> Ingesting Fact Genome Scores (genome-scores.csv in 2M chunks)...")
                 t_gs = time.time()
                 total_gs = 0
-                for i, chunk in enumerate(pd.read_csv(gs_path, chunksize=2_000_000)):
+                cur.execute("SELECT movie_id FROM dim_movies")
+                sample_movie_ids = {row[0] for row in cur.fetchall()}
+                for i, chunk in enumerate(pd.read_csv(gs_path, chunksize=2_000_000, nrows=DATA_LIMIT)):
+                    chunk = chunk[chunk['movieId'].isin(sample_movie_ids)].copy()
                     buf_gs = io.StringIO()
                     chunk[['movieId', 'tagId', 'relevance']].to_csv(buf_gs, sep='\t', index=False, header=False)
                     fast_copy(cur, 'fact_genome_scores', ['movie_id', 'tag_id', 'relevance'], buf_gs)

@@ -29,6 +29,7 @@ local_settings.py
 *.env
 db.sqlite3
 db.sqlite3-journal
+movie_lens/staticfiles/
 architecture_diagrams.html
 
 COMPLETE_DEVELOPER_GUIDE

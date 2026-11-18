@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: movielens-dashboard
+    runtime: python
+    plan: free
+    rootDir: movie_lens
+    buildCommand: "./build.sh"
+    startCommand: "gunicorn movie_lens_dashboard.wsgi:application"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.0
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DEBUG
+        value: "False"
+      - key: DATABASE_URL
+        sync: false

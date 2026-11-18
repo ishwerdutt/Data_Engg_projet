@@ -79,8 +79,3 @@ FROM ranked_tags
 WHERE rnk <= 15;
 
 CREATE INDEX IF NOT EXISTS idx_mv_popular_tags_genre_rnk ON mv_popular_tags_genre(genre_name, rnk);
-
--- 10. Grant privileges to Django application user
-GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO gumbo;
-GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO gumbo;
-GRANT ALL PRIVILEGES ON TABLE mv_movie_rating_stats, mv_genre_year_summary, mv_popular_tags_genre TO gumbo;
