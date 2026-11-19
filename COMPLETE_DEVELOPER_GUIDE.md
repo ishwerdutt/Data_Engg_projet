@@ -51,12 +51,14 @@
    - [7.1 Role-Based Access Control (RBAC) Specification](#71-role-based-access-control-rbac-specification)
    - [7.2 Transactional Upsert Lifecycle (`INSERT ... ON CONFLICT`)](#72-transactional-upsert-lifecycle-insert--on-conflict)
    - [7.3 Auto-Provisioning Foreign Keys (`dim_date`, `dim_users`)](#73-auto-provisioning-foreign-keys-dim_date-dim_users)
-   - [7.4 Reactive Frontend Chart Synchronization](#74-reactive-frontend-chart-synchronization)
+   - [7.4 Surrogate Key Partitioning & Collision Defense (+1,000,000 Offset)](#74-surrogate-key-partitioning--collision-defense-1000000-offset)
+   - [7.5 Reactive Frontend Chart Synchronization](#75-reactive-frontend-chart-synchronization)
 8. [Interactive Presentation Layer & Single-Page Dashboard (`dashboard.html`)](#8-interactive-presentation-layer--single-page-dashboard-dashboardhtml)
    - [8.1 Single-Page Application (SPA) Architectural Pattern](#81-single-page-application-spa-architectural-pattern)
    - [8.2 Frontend State Machine & Async Controller](#82-frontend-state-machine--async-controller)
    - [8.3 The Input Debounce Algorithm](#83-the-input-debounce-algorithm)
-   - [8.4 Chart.js Canvas Memory Management & Cleanup](#84-chartjs-canvas-memory-management--cleanup)
+   - [8.4 Dual Theme Engine Architecture (Swiss Minimalist & Forest Emerald Bento)](#84-dual-theme-engine-architecture-swiss-minimalist--forest-emerald-bento)
+   - [8.5 Chart.js Canvas Memory Management & Cleanup](#85-chartjs-canvas-memory-management--cleanup)
 9. [Verification, Quality Assurance & Integration Testing (`test_suite.py`)](#9-verification-quality-assurance--integration-testing-test_suitepy)
    - [9.1 Test Harness Architecture](#91-test-harness-architecture)
    - [9.2 Detailed Test Case Walkthrough (13 Test Specs)](#92-detailed-test-case-walkthrough-13-test-specs)
@@ -65,6 +67,7 @@
     - [Recipe 2: Adding a Brand-New Analytical Metric, API & Chart](#recipe-2-adding-a-brand-new-analytical-metric-api--chart)
     - [Recipe 3: Zero-Downtime Materialized View Maintenance](#recipe-3-zero-downtime-materialized-view-maintenance)
     - [Recipe 4: Tuning PostgreSQL Memory Buffers for Extreme Loads](#recipe-4-tuning-postgresql-memory-buffers-for-extreme-loads)
+    - [Recipe 5: Production Deployment on Render (`render.yaml` & CSRF Defense)](#recipe-5-production-deployment-on-render-renderyaml--csrf-defense)
 11. [Production Troubleshooting & Diagnostic Playbook](#11-production-troubleshooting--diagnostic-playbook)
 12. [A-to-Z Master Data Engineering Glossary](#12-a-to-z-master-data-engineering-glossary)
 
@@ -914,7 +917,7 @@ flowchart TD
 
 ### 7.2 Transactional Upsert Lifecycle (`INSERT ... ON CONFLICT`)
 
-When a user submits a star rating via `POST /api/ratings/rate/`:
+When an authenticated user submits a star rating via `POST /api/ratings/rate/`:
 
 ```mermaid
 sequenceDiagram
@@ -926,42 +929,101 @@ sequenceDiagram
 
     Client->>View: POST /api/ratings/rate/ { movie_id: 1, rating: 4.5 }
     Note over View: Validates user.is_authenticated & rating in [0.5, 5.0]
-    View->>Srv: upsert_user_rating(user_id=101, movie_id=1, rating=4.5)
-    Note over Srv: Generates date_key = 20261031
-    Srv->>PG: Auto-provisions dim_date & dim_users if missing
-    Srv->>PG: SELECT rating_id FROM fact_ratings WHERE user_id = 101 AND movie_id = 1
+    View->>Srv: upsert_user_rating(user_id=1, movie_id=1, rating=4.5)
+    Note over Srv: Maps user_id=1 -> warehouse_user_id=1,000,001 (+1M Offset)
+    Note over Srv: Computes date_key = YYYYMMDD (e.g. 20261118)
+    Srv->>PG: Auto-provisions dim_date & dim_users (user_id=1000001) if missing
+    Srv->>PG: SELECT rating_id FROM fact_ratings WHERE user_id = 1000001 AND movie_id = 1
     alt Rating Already Exists
         PG-->>Srv: Found rating_id = 459012
-        Srv->>PG: UPDATE fact_ratings SET rating = 4.5, date_key = 20261031 WHERE rating_id = 459012
-        Srv-->>View: { action: 'updated', rating_id: 459012 }
+        Srv->>PG: UPDATE fact_ratings SET rating = 4.5, date_key = 20261118 WHERE rating_id = 459012
+        Srv-->>View: { action: 'updated', rating_id: 459012, warehouse_user_id: 1000001 }
     else First-Time Rating
         PG-->>Srv: No existing row
-        Srv->>PG: INSERT INTO fact_ratings (user_id, movie_id, date_key, rating) VALUES (...)
-        Srv-->>View: { action: 'inserted' }
+        Srv->>PG: INSERT INTO fact_ratings (user_id, movie_id, date_key, rating) VALUES (1000001, 1, 20261118, 4.5)
+        Srv-->>View: { action: 'inserted', warehouse_user_id: 1000001 }
     end
     View-->>Client: HTTP 200 { success: true, action: 'updated', latency_ms: 1.8 }
-    Note over Client: Displays green toast & live-refreshes Rating Histogram!
+    Note over Client: Displays toast & live-refreshes Scenario 3(d) Histogram!
 ```
 
 ---
 
 ### 7.3 Auto-Provisioning Foreign Keys (`dim_date`, `dim_users`)
 
-If a newly registered user submits a review today:
-1. `dim_users`: If the Django user ID does not exist in `dim_users`, our service automatically runs:
+If a newly registered user submits a review:
+1. `dim_users`: The segregated warehouse user ID (`1,000,001+`) is provisioned on demand:
    ```sql
-   INSERT INTO dim_users (user_id) VALUES (%s) ON CONFLICT DO NOTHING;
+   INSERT INTO dim_users (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING;
    ```
-2. `dim_date`: If today's date key (`YYYYMMDD`) does not exist, our service provisions today's record into `dim_date`:
+2. `dim_date`: If today's calendar key (`YYYYMMDD`) does not exist, today's dimension tuple is generated on the fly:
    ```sql
    INSERT INTO dim_date (date_key, full_date, year, quarter, month, day)
-   VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING;
+   VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (date_key) DO NOTHING;
    ```
-This prevents foreign key constraint violation crashes (`violates foreign key constraint "fact_ratings_user_id_fkey"`).
+This prevents foreign key constraint crashes (`violates foreign key constraint "fact_ratings_user_id_fkey"` or `"fact_ratings_date_key_fkey"`).
 
 ---
 
-### 7.4 Reactive Frontend Chart Synchronization
+### 7.4 Surrogate Key Partitioning & Collision Defense (+1,000,000 Offset)
+
+#### The Collision Threat
+The MovieLens dataset includes **200,948 historical benchmark users** (`user_id: 1 .. 200,948`). In contrast, Django’s operational auth database (`auth_user`) increments sequentially from `1` (`auth_user.id = 1, 2, 3...`).
+
+Without defense, the first web user to register (`auth_user.id = 1`) would collide with historical user 1, overwriting ratings submitted in 1996 and corrupting academic analytical benchmarks.
+
+```mermaid
+flowchart LR
+    subgraph Danger["❌ Unmanaged Collision Threat"]
+        D1["Django auth_user (id = 1)"] -->|COLLIDES WITH| W1["Historical User 1 (1996 ratings overwritten!)"]
+    end
+
+    subgraph Defense["✅ +1M Deterministic Offset Partitioning"]
+        D2["Django auth_user (id = 1)"] -->|to_warehouse_user_id()| W2["dim_users (user_id = 1,000,001)"]
+        H1["Historical Users (1 .. 200,948)"] -->|Untouched partition| W3["dim_users (user_id < 1,000,000)"]
+    end
+```
+
+#### The Deterministic Offset Architecture
+We isolate live web ratings from static historical data via `LIVE_USER_OFFSET = 1_000_000`:
+
+$$\text{warehouse\_user\_id} = 1{,}000{,}000 + \text{auth\_user.id}$$
+
+- **Historical Benchmark Partition**: $\text{user\_id} \in [1, 200{,}948]$ ($< 10^6$) — Immutable legacy evaluation facts.
+- **Live Transactional Partition**: $\text{user\_id} \in [1{,}000{,}001, \infty)$ ($\ge 10^6$) — Dynamic web user feedback.
+
+#### Implementation in `services/analytics.py`
+```python
+LIVE_USER_OFFSET = 1_000_000
+
+
+def to_warehouse_user_id(user_id: int) -> int:
+    """
+    Surrogate Key Isolation (Problem 4):
+    Offsets Django auth_user.id by +1,000,000 to prevent surrogate key collisions
+    with historical MovieLens dataset users (range: 1 - 200,948).
+    Live web application users are segregated into the 1,000,001+ range in dim_users.
+    """
+    if user_id is None:
+        return None
+    uid = int(user_id)
+    if uid >= LIVE_USER_OFFSET:
+        return uid
+    return uid + LIVE_USER_OFFSET
+```
+
+All rating functions (`get_user_movie_rating`, `upsert_user_rating`, `get_user_rating`) route through `to_warehouse_user_id()`.
+
+#### Key Benefits
+1. **Zero Database Migrations**: No schema alterations or downtime required across 33.8 million rows.
+2. **Instant Partition Slicing**: Slicing historical vs live ratings is a fast integer boundary comparison:
+   - Historical evaluation: `WHERE user_id < 1000000`
+   - Live user ratings: `WHERE user_id >= 1000000`
+3. **Auditability**: Mapped `warehouse_user_id` is explicitly returned in API responses.
+
+---
+
+### 7.5 Reactive Frontend Chart Synchronization
 
 Once the server responds with `{ success: true }`, the frontend does not reload the page. Instead, it dispatches an asynchronous call to `/api/analytics/rating-distribution/?movie_id=X`, re-queries the covering index, and re-renders the rating histogram with the newly submitted score reflected live!
 
@@ -1063,7 +1125,56 @@ searchInput.addEventListener('input', () => {
 
 ---
 
-### 8.4 Chart.js Canvas Memory Management & Cleanup
+### 8.4 Dual Theme Engine Architecture (Swiss Minimalist & Forest Emerald Bento)
+
+The UI implements a dual-theme architectural engine switchable in real time:
+- **Swiss Minimalist Dossier (`data-theme="swiss"`)**: High-contrast brutalist styling, strict monospace metric callouts, clean black hairline borders, and neutral-tinted Chart.js canvas elements.
+- **Forest Emerald Bento (`data-theme="emerald"`)**: Deep slate obsidian backgrounds (`#090e0e`), luminous emerald badges (`#10b981`), glassmorphic translucent panels (`rgba(16, 185, 129, 0.08)`), and forest-themed visualization palettes.
+
+```mermaid
+flowchart LR
+    A["User Clicks Theme Switcher"] --> B{"Current Theme?"}
+    B -- "emerald" --> C["Set data-theme='swiss' on &lt;html&gt;"]
+    B -- "swiss" --> D["Set data-theme='emerald' on &lt;html&gt;"]
+    C & D --> E["localStorage.setItem('theme', newTheme)"]
+    E --> F["Execute recolorCharts()"]
+    F --> G["Redraw all Chart.js instances with updated palette"]
+```
+
+| Theme Dimension | **Swiss Minimalist Dossier** (`data-theme="swiss"`) | **Forest Emerald Bento** (`data-theme="emerald"`) |
+| :--- | :--- | :--- |
+| **Visual Aesthetic** | International Typographic, monochrome, brutalist borders | Dark glassmorphism, glowing emerald accents, slate depth |
+| **Background** | Clean paper `#f4f4f0` / stark `#ffffff` panels | Deep slate obsidian `#090e0e` / translucent cards |
+| **Borders** | Solid hairline ink `1.5px solid #171717` | Subtle glowing emerald `1px solid rgba(16, 185, 129, 0.2)` |
+| **Accent Color** | Sharp crimson `#dc2626` / deep black `#000000` | Luminous emerald `#10b981` / mint green `#34d399` |
+| **Chart Palette** | Crisp monochrome bars with high-contrast active highlights | Gradient emerald translucent fills with mint border glows |
+
+#### Chart.js Reactive Color Synchronization
+When switching themes, Chart.js gridlines, axis labels, and tooltip backgrounds rebind reactively without data refetch:
+```javascript
+function recolorCharts() {
+    const isEmerald = document.documentElement.getAttribute('data-theme') === 'emerald';
+    const textColor = isEmerald ? '#94a3b8' : '#525252';
+    const gridColor = isEmerald ? 'rgba(255, 255, 255, 0.06)' : 'rgba(0, 0, 0, 0.06)';
+    
+    Object.values(chartInstances).forEach(chart => {
+        if (!chart) return;
+        if (chart.options.scales?.x) {
+            chart.options.scales.x.ticks.color = textColor;
+            chart.options.scales.x.grid.color = gridColor;
+        }
+        if (chart.options.scales?.y) {
+            chart.options.scales.y.ticks.color = textColor;
+            chart.options.scales.y.grid.color = gridColor;
+        }
+        chart.update('none'); // Instant transition without animation lag
+    });
+}
+```
+
+---
+
+### 8.5 Chart.js Canvas Memory Management & Cleanup
 
 Calling `new Chart(ctx, ...)` on an existing `<canvas>` element creates a second rendering context that causes memory leaks and visual flicker.
 We solve this with a central chart registry:
@@ -1217,6 +1328,46 @@ work_mem = 64MB                       # Memory allocated for in-memory sorting &
 maintenance_work_mem = 1GB            # Speeds up index builds and materialized views
 effective_cache_size = 12GB           # Tells planner how much OS cache is available
 max_parallel_workers_per_gather = 4   # Enables 4 CPU cores for parallel queries
+```
+
+---
+
+### Recipe 5: Production Deployment on Render (`render.yaml` & CSRF Defense)
+
+The platform is configured for automated cloud deployment via [Render](https://render.com) using Infrastructure-as-Code (`render.yaml`).
+
+#### Step 1: Render Configuration (`render.yaml`)
+```yaml
+services:
+  - type: web
+    name: movielens-dashboard
+    runtime: python
+    buildCommand: "pip install -r requirements.txt && python movie_lens/manage.py collectstatic --noinput"
+    startCommand: "gunicorn movie_lens.wsgi:application --bind 0.0.0.0:$PORT"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
+      - key: DJANGO_SETTINGS_MODULE
+        value: movie_lens.settings
+      - key: DEBUG
+        value: "False"
+```
+
+#### Step 2: Production CSRF & Security Configuration
+Django requires explicit trusted origins when running behind modern HTTPS reverse proxies:
+```python
+CSRF_TRUSTED_ORIGINS = [
+    'https://*.onrender.com',
+    'https://movielens-dashboard.onrender.com',
+    'http://localhost:8000',
+    'http://127.0.0.1:8000',
+]
+```
+
+#### Step 3: Mobile Form Ergonomics
+To prevent mobile devices from automatically capitalizing usernames during login/registration:
+```html
+<input type="text" name="username" autocapitalize="none" autocorrect="off" spellcheck="false" required>
 ```
 
 ---
